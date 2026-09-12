@@ -51,11 +51,17 @@ def fresnel_radius_m(distance_km: float, frequency_ghz: float) -> float:
     return 8.66 * math.sqrt(distance_km / frequency_ghz)
 
 
-def earth_bulge_m(distance_km: float, k: float = 4 / 3) -> float:
-    """Approximate mid-path earth bulge (m) for effective earth radius factor k."""
-    # d1=d2=d/2 in km → bulge ≈ (d1*d2)/(2*k*6371) * 1000 m... common approx:
-    # h ≈ 0.078 * d_km^2 / k  (meters) for whole path midpoint rule of thumb.
-    return 0.078 * (distance_km ** 2) / k
+def earth_bulge_m(distance_km: float, k: float = 4 / 3, earth_radius_km: float = 6371.0) -> float:
+    """Mid-path earth bulge (m) for effective-earth-radius factor k.
+
+    h = d1·d2 / (2·k·R) with d1 = d2 = d/2 → h = d² / (8·k·R).
+    In km² form: h_m ≈ 0.0196 · d_km² / k  (R = 6371 km). The older 0.078
+    coefficient treated d1·d2 as d² instead of (d/2)² and was 4× too large.
+    """
+    if distance_km < 0 or k <= 0 or earth_radius_km <= 0:
+        raise ValueError("distance, k, and earth radius must be positive")
+    # metres: (d_km * 1000)² / (8 * k * R_km * 1000) = d_km² * 125 / (k * R_km)
+    return (distance_km ** 2) * 125.0 / (k * earth_radius_km)
 
 
 def compute(inp: LinkBudgetInput) -> LinkBudgetResult:

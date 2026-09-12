@@ -1,7 +1,7 @@
 """Hardware testbench skeleton: same scenarios against sim mock or real modules.
 
 When lab hardware arrives, swap Transport from MockTransport / DryRun to
-Iperf3Transport + UdpControlProbe pointing at real module IPs. No RF code here.
+Iperf3Transport pointing at real module IPs. No RF code here.
 """
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from dataclasses import asdict, dataclass, field
 import json
 import math
 import random
+import shutil
 import statistics
+import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 
 @dataclass
@@ -26,8 +28,8 @@ class StepResult:
 
 @dataclass
 class BenchConfig:
-    """Target endpoints — fill with real module addresses when hardware arrives."""
     mode: str = "dry-run"  # dry-run | mock | iperf3
+    # Target endpoints: fill with real module addresses when hardware arrives.
     center_host: str = "192.168.1.10"
     terminal_host: str = "192.168.1.20"
     iperf_port: int = 5201
@@ -110,36 +112,157 @@ class MockTransport(Transport):
         return {"samples_ms": samples, "backend": "mock", "video_mbps": self._video_mbps}
 
 
-class Iperf3Transport(Transport):
-    """Real-device adapter stub: shells out to iperf3 when mode=iperf3.
+def parse_iperf3_json(payload: Union[str, bytes, dict]) -> dict:
+    """Parse `iperf3 -J` client JSON into the bench throughput row shape.
 
-    Requires iperf3 on PATH and reachable module IPs. Not invoked in unit tests.
+    Works offline from a saved report; no live server required for unit tests.
+    Prefers UDP end fields; falls back to TCP sum_received / sum_sent.
+    """
+    data: Any = json.loads(payload) if isinstance(payload, (str, bytes)) else payload
+    end = data.get("end") or {}
+    # UDP: end["sum"] has bits_per_second and lost_percent; TCP uses sum_received.
+    summary = end.get("sum") or end.get("sum_received") or end.get("sum_sent") or {}
+    bps = float(summary.get("bits_per_second") or 0.0)
+    goodput_mbps = bps / 1e6
+    if "lost_percent" in summary:
+        loss_pct = float(summary["lost_percent"])
+    else:
+        lost = float(summary.get("lost_packets") or 0)
+        sent = float(summary.get("packets") or summary.get("retransmits") or 0)
+        loss_pct = (lost / sent * 100.0) if sent else 0.0
+    start = data.get("start") or {}
+    target = start.get("target_bitrate")  # bits/s when present
+    offered = (float(target) / 1e6) if target else goodput_mbps
+    # Some builds only put -b in the command line string.
+    if not target:
+        for key in ("test_start",):
+            ts = start.get(key) or {}
+            if ts.get("target_bitrate"):
+                offered = float(ts["target_bitrate"]) / 1e6
+                break
+    duration = float(summary.get("seconds") or start.get("test_start", {}).get("duration") or 0)
+    return {
+        "offered_mbps": round(offered, 3),
+        "goodput_mbps": round(goodput_mbps, 3),
+        "loss_pct": round(loss_pct, 2),
+        "duration_s": duration,
+        "backend": "iperf3-json",
+        "raw_keys": sorted(end.keys()),
+    }
+
+
+class Iperf3Transport(Transport):
+    """Lab adapter: subprocess `iperf3 -J` or offline JSON (no RF code).
+
+    Unit tests exercise `parse_iperf3_json` only. Live runs need `iperf3` on PATH
+    and a reachable `-s` on `terminal_host`. Pass `json_dir` to replay saved reports.
     """
 
-    def __init__(self, cfg: BenchConfig):
+    def __init__(self, cfg: BenchConfig, json_dir: Optional[Path] = None,
+                 run_subprocess: bool = True):
         self.cfg = cfg
+        self.json_dir = Path(json_dir) if json_dir else None
+        self.run_subprocess = run_subprocess
+        self._video_proc: Optional[subprocess.Popen] = None
+        self._video_mbps = 0.0
+
+    def _cmd(self, mbps: float, duration_s: float) -> List[str]:
+        return [
+            "iperf3", "-c", self.cfg.terminal_host, "-u",
+            "-b", f"{mbps}M", "-t", str(duration_s),
+            "-p", str(self.cfg.iperf_port), "-J",
+        ]
 
     def measure_throughput(self, mbps: float, duration_s: float) -> dict:
-        # Intentionally not executed unless operator opts in — document the command.
-        cmd = (f"iperf3 -c {self.cfg.terminal_host} -u -b {mbps}M "
-               f"-t {duration_s} -p {self.cfg.iperf_port} -J")
-        raise NotImplementedError(
-            "Real iperf3 run not auto-executed in this environment. "
-            f"On the lab PC run:\n  {cmd}\n"
-            "Then paste JSON into artifacts or extend this method to subprocess + parse."
-        )
+        if self.json_dir:
+            path = self.json_dir / f"iperf-{mbps:g}M.json"
+            if path.exists():
+                row = parse_iperf3_json(path.read_text(encoding="utf-8"))
+                row["offered_mbps"] = mbps
+                row["duration_s"] = duration_s
+                row["source"] = str(path)
+                return row
+        if not self.run_subprocess:
+            raise FileNotFoundError(
+                f"No offline JSON at {self.json_dir} and subprocess disabled"
+            )
+        if not shutil.which("iperf3"):
+            raise FileNotFoundError(
+                "iperf3 not on PATH. Install it, or drop `iperf3 -J` JSON under "
+                f"{self.json_dir or 'json_dir'} as iperf-<Mbps>M.json"
+            )
+        cmd = self._cmd(mbps, duration_s)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=duration_s + 30)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"iperf3 failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout[:200]}"
+            )
+        row = parse_iperf3_json(proc.stdout)
+        row["offered_mbps"] = mbps
+        row["duration_s"] = duration_s
+        row["backend"] = "iperf3"
+        row["cmd"] = " ".join(cmd)
+        return row
 
     def inject_video_load(self, mbps: float, duration_s: float) -> dict:
-        raise NotImplementedError(
-            f"Start background: iperf3 -c {self.cfg.terminal_host} -u -b {mbps}M "
-            f"-t {duration_s} -p {self.cfg.iperf_port}"
-        )
+        self._video_mbps = mbps
+        if self.json_dir and not self.run_subprocess:
+            return {"offered_mbps": mbps, "duration_s": duration_s,
+                    "backend": "iperf3-json-offline", "note": "no live flood"}
+        if not shutil.which("iperf3"):
+            raise FileNotFoundError("iperf3 not on PATH for video inject")
+        cmd = self._cmd(mbps, duration_s)
+        # Background flood; control probe runs concurrently in DeviceBench.
+        self._video_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return {"offered_mbps": mbps, "duration_s": duration_s,
+                "backend": "iperf3", "pid": self._video_proc.pid, "cmd": " ".join(cmd)}
 
     def probe_control_latency(self, hz: float, seconds: float, payload: int) -> dict:
-        raise NotImplementedError(
-            "Point UdpControlProbe at module Ethernet; record send/recv timestamps "
-            f"on {self.cfg.terminal_host}:{self.cfg.control_port} at {hz} Hz."
-        )
+        """Paced UDP send timestamps only (one-way send pacing / local RTT if echo).
+
+        Without a module echo service this records inter-send jitter as a stand-in
+        so the report pipeline stays identical; lab should replace with PPS-aligned
+        two-ended capture when available.
+        """
+        import socket
+        n = max(1, int(hz * seconds))
+        interval = 1.0 / hz if hz > 0 else 0.02
+        body = bytes([0xA5]) * max(1, payload)
+        samples = []
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.05)
+        try:
+            addr = (self.cfg.terminal_host, self.cfg.control_port)
+            for _ in range(n):
+                t0 = time.perf_counter()
+                try:
+                    sock.sendto(body, addr)
+                    try:
+                        sock.recvfrom(2048)
+                        samples.append((time.perf_counter() - t0) * 1000.0)
+                    except socket.timeout:
+                        # No echo: use schedule adherence as soft latency proxy.
+                        samples.append((time.perf_counter() - t0) * 1000.0)
+                except OSError:
+                    samples.append(float("nan"))
+                elapsed = time.perf_counter() - t0
+                time.sleep(max(0.0, interval - elapsed))
+        finally:
+            sock.close()
+            if self._video_proc and self._video_proc.poll() is None:
+                self._video_proc.terminate()
+        finite = [x for x in samples if math.isfinite(x)]
+        return {"samples_ms": finite, "backend": "udp-probe",
+                "video_mbps": self._video_mbps, "sent": n, "echo_or_local": len(finite)}
+
+    def close(self):
+        if self._video_proc and self._video_proc.poll() is None:
+            self._video_proc.terminate()
+            try:
+                self._video_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._video_proc.kill()
 
 
 def _latency_stats(samples: List[float]) -> dict:
@@ -253,7 +376,7 @@ def write_report(result: dict, output_dir: Path) -> Path:
         "## 样机到达当日清单",
         "",
         "1. 中心 / 终端以太网互通，记录 IP；改 `BenchConfig.center_host` / `terminal_host`。",
-        "2. 终端侧启动 `iperf3 -s`；本机 `--mode iperf3`（需补全 `Iperf3Transport` 的 subprocess 解析，或手工跑命令把 JSON 放进本目录）。",
+        "2. 终端侧启动 `iperf3 -s`；本机 `--mode iperf3`（或 `--json-dir` 喂入已保存的 `-J` JSON）。",
         "3. 遥控探测：对透传 UDP/UART 隧道发 50 Hz 小包，采集单端或 PPS 对齐时延。",
         "4. 对比 dry-run / mock 曲线与真机拐点；拥塞项以「视频满载 + 控制 P99」为准。",
         "",
@@ -265,21 +388,31 @@ def write_report(result: dict, output_dir: Path) -> Path:
 
 def main(argv=None):
     import argparse
-    parser = argparse.ArgumentParser(description="Device testbench (dry-run/mock/iperf3 stub)")
+    parser = argparse.ArgumentParser(description="Device testbench (dry-run/mock/iperf3)")
     parser.add_argument("--mode", choices=("dry-run", "mock", "iperf3"), default="dry-run")
     parser.add_argument("--output", default="artifacts/cli-runs/device-bench")
     parser.add_argument("--center", default="192.168.1.10")
     parser.add_argument("--terminal", default="192.168.1.20")
     parser.add_argument("--video-mbps", type=float, default=8.0)
+    parser.add_argument("--json-dir", default="",
+                        help="Offline iperf3 -J JSON dir (files named iperf-<Mbps>M.json)")
     args = parser.parse_args(argv)
     cfg = BenchConfig(mode=args.mode, center_host=args.center, terminal_host=args.terminal,
                       video_inject_mbps=args.video_mbps)
+    json_dir = Path(args.json_dir) if args.json_dir else Path(args.output)
     if args.mode == "iperf3":
-        print("iperf3 mode is a real-device adapter stub; use dry-run or mock until lab IPs ready.")
-        print(Iperf3Transport(cfg).measure_throughput.__doc__)
-        return
-    bench = DeviceBench(cfg)
-    result = bench.run_all()
+        transport = Iperf3Transport(
+            cfg, json_dir=json_dir,
+            run_subprocess=not bool(args.json_dir),
+        )
+        bench = DeviceBench(cfg, transport)
+        try:
+            result = bench.run_all()
+        finally:
+            transport.close()
+    else:
+        bench = DeviceBench(cfg)
+        result = bench.run_all()
     path = write_report(result, Path(args.output))
     print(f"all_ok={result['all_ok']} report={path}")
 

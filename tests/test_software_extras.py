@@ -4,8 +4,11 @@ import unittest
 from pathlib import Path
 import tempfile
 
-from nebula_mvp.device_bench import BenchConfig, DeviceBench, MockTransport, write_report
-from nebula_mvp.link_budget import LinkBudgetInput, compute, fspl_db, compare_bands
+from nebula_mvp.device_bench import (
+    BenchConfig, DeviceBench, MockTransport, write_report,
+    parse_iperf3_json, Iperf3Transport,
+)
+from nebula_mvp.link_budget import LinkBudgetInput, compute, fspl_db, compare_bands, earth_bulge_m
 from nebula_mvp.interfaces import (
     encode_sbus, decode_sbus, channels_neutral, mavlink_v1_header,
     MavlinkSeqMonitor, FailsafeConfig, FailsafeMachine, FailsafeAction, SBUS_FRAME_LEN,
@@ -28,6 +31,45 @@ class DeviceBenchTests(unittest.TestCase):
         step = DeviceBench(cfg).run_iperf_steps()
         self.assertIsNotNone(step.metrics["knee_offered_mbps"])
 
+    def test_parse_iperf3_udp_json(self):
+        sample = {
+            "start": {"target_bitrate": 10_000_000},
+            "end": {
+                "sum": {
+                    "bits_per_second": 9_500_000,
+                    "lost_percent": 2.5,
+                    "seconds": 3.0,
+                    "packets": 1000,
+                    "lost_packets": 25,
+                }
+            },
+        }
+        row = parse_iperf3_json(sample)
+        self.assertAlmostEqual(row["offered_mbps"], 10.0, places=2)
+        self.assertAlmostEqual(row["goodput_mbps"], 9.5, places=2)
+        self.assertAlmostEqual(row["loss_pct"], 2.5, places=2)
+
+    def test_iperf3_offline_json_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for mbps in (5, 10, 20, 30, 40):
+                delivered = mbps if mbps <= 28 else 20.0
+                loss = 0.0 if mbps <= 28 else 40.0
+                payload = {
+                    "start": {"target_bitrate": int(mbps * 1e6)},
+                    "end": {"sum": {
+                        "bits_per_second": delivered * 1e6,
+                        "lost_percent": loss,
+                        "seconds": 3.0,
+                    }},
+                }
+                (root / f"iperf-{mbps:g}M.json").write_text(
+                    __import__("json").dumps(payload), encoding="utf-8")
+            cfg = BenchConfig(mode="iperf3", control_seconds=0.2, control_hz=20)
+            transport = Iperf3Transport(cfg, json_dir=root, run_subprocess=False)
+            step = DeviceBench(cfg, transport).run_iperf_steps()
+            self.assertEqual(step.metrics["knee_offered_mbps"], 30)
+
 
 class LinkBudgetTests(unittest.TestCase):
     def test_section_24_reference_2400mhz_12km(self):
@@ -36,6 +78,14 @@ class LinkBudgetTests(unittest.TestCase):
         self.assertAlmostEqual(r.fspl_db, 121.6, delta=0.2)
         self.assertAlmostEqual(r.rx_power_dbm, -81.6, delta=0.3)
         self.assertAlmostEqual(r.margin_db, 17.4, delta=1.0)
+
+    def test_earth_bulge_midpath_12km(self):
+        # REVIEW §2.2: h = d²/(8kR) → ~2.12 m at 12 km, k=4/3 (not 8.42 m).
+        bulge = earth_bulge_m(12.0)
+        self.assertAlmostEqual(bulge, 2.12, delta=0.05)
+        r = compute(LinkBudgetInput(frequency_mhz=2400, distance_km=12))
+        self.assertAlmostEqual(r.earth_bulge_m, 2.12, delta=0.05)
+        self.assertAlmostEqual(r.clearance_hint_m, 21.5, delta=0.2)
 
     def test_higher_frequency_more_loss(self):
         a = fspl_db(2400, 12)

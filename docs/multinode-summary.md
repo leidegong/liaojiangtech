@@ -17,15 +17,17 @@
 | 7 | 6.9 | 27.552 | 7 | 是 |
 | 8 | 6.9 | 31.488 | 8 | 是 |
 | 9 | 6.9 | 35.424 | 9 | 是 |
-| 10 | 6.9 | 38.345 | 9 | 否 |
-| 11 | 6.9 | 37.838 | 8 | 否 |
-| 12 | 6.9 | 37.585 | 9 | 否 |
-| 13 | 6.9 | 36.823 | 8 | 否 |
-| 14 | 6.9 | 37.713 | 8 | 否 |
-| 15 | 6.9 | 37.719 | 0 | 否 |
-| 16 | 6.9 | 38.218 | 9 | 否 |
+| 10 | 6.9 | 38.344 | 10 | 是 |
+| 11 | 6.9 | 37.592 | 0 | 否 |
+| 12 | 6.9 | 36.83 | 0 | 否 |
+| 13 | 6.9 | 36.068 | 0 | 否 |
+| 14 | 6.9 | 35.306 | 0 | 否 |
+| 15 | 6.9 | 34.544 | 0 | 否 |
+| 16 | 6.9 | 33.782 | 0 | 否 |
 
-**结论：** Under 40 Mbps + fusion_fair, with 16 terminals keeping control+telemetry, scheduler delivers ≥3.5 Mbps on each of at most 9 concurrent ~4 Mbps primaries (raw fill). §2.6 70%-margin rule gives ~6 streams. 16 concurrent HD streams are not viable (need ~96 Mbps stable capacity).
+**结论：** Under 40 Mbps + fusion_fair, with 16 terminals keeping control+telemetry, scheduler delivers ≥3.5 Mbps on each of at most 10 concurrent ~4 Mbps primaries (raw fill). §2.6 70%-margin rule gives ~6 streams. 16 concurrent HD streams are not viable (need ~96 Mbps stable capacity).
+
+> 说明：控制包小且严格最高优先级，上表 `控制 P99 max` 对视频路数几乎不变（≈6.9 ms），不携带「视频是否过载」信息；区分能力靠「≥3.5 Mbps 可用 / 全部可用」。k≥11 时公平均分后每路约 2 Mbps，故可用列变为 0（不再出现修复前饿死导致的 0→9 跳变）。
 
 ## 2. 弱链路终端会不会拖垮别人？
 
@@ -33,9 +35,9 @@
 |---|---:|---:|---:|
 | fifo | 903.6 | 904.4 | 2.564 |
 | fusion_global | 17.7 | 18.5 | 2.667 |
-| fusion_fair | 18.5 | 18.2 | 2.667 |
+| fusion_fair | 18.2 | 18.5 | 2.667 |
 
-**结论：** At 12 Mbps shared capacity, weak terminal (efficiency 0.25) with primary video: FIFO others control P99=904.4 ms vs fusion_fair 18.2 ms (≈49.6×). Without priority isolation, a weak uplink burns shared airtime and raises peers' control latency; Fusion keeps peers' control prioritized.
+**结论：** At 12 Mbps shared capacity, weak terminal (efficiency 0.25) with primary video: FIFO others control P99=904.4 ms vs fusion_fair 18.5 ms (≈49.0×). Without priority isolation, a weak uplink burns shared airtime and raises peers' control latency; Fusion keeps peers' control prioritized.
 
 ## 3. 切换主视频源时他人遥控是否中断？
 

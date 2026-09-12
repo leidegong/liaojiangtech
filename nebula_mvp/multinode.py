@@ -93,7 +93,9 @@ class MultiNodeScheduler:
         self.control: Dict[int, PacketEvent] = {}
         self.data: Dict[int, Deque[PacketEvent]] = defaultdict(deque)
         self.video: Dict[int, Deque[PacketEvent]] = defaultdict(deque)
-        self._rr = {"control": 0, "data": 0, "video": 0}
+        # Last served node_id per kind (−1 = none yet). Indexed by id, not by
+        # position in the current non-empty list (see REVIEW §2.1).
+        self._rr = {"control": -1, "data": -1, "video": -1}
         self.free_at = 0
         self.dropped = defaultdict(int)
 
@@ -118,22 +120,30 @@ class MultiNodeScheduler:
                 self.dropped["video_overflow"] += 1
             q.append(pkt)
 
-    def _pop_control_fair(self) -> Optional[PacketEvent]:
-        ids = sorted(self.control)
+    def _next_fair_id(self, kind: str, ids: List[int]) -> Optional[int]:
+        """Pick the next non-empty node by ascending id after the last served id."""
         if not ids:
             return None
-        start = self._rr["control"] % len(ids)
-        nid = ids[start]
-        self._rr["control"] = start + 1
+        last = self._rr[kind]
+        for nid in ids:
+            if nid > last:
+                self._rr[kind] = nid
+                return nid
+        self._rr[kind] = ids[0]
+        return ids[0]
+
+    def _pop_control_fair(self) -> Optional[PacketEvent]:
+        ids = sorted(self.control)
+        nid = self._next_fair_id("control", ids)
+        if nid is None:
+            return None
         return self.control.pop(nid)
 
     def _pop_queue_fair(self, kind: str, store: Dict[int, Deque[PacketEvent]]) -> Optional[PacketEvent]:
         ids = sorted(nid for nid, q in store.items() if q)
-        if not ids:
+        nid = self._next_fair_id(kind, ids)
+        if nid is None:
             return None
-        start = self._rr[kind] % len(ids)
-        nid = ids[start]
-        self._rr[kind] = start + 1
         return store[nid].popleft()
 
     def _pop_control_global(self) -> Optional[PacketEvent]:
