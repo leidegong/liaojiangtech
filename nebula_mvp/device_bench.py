@@ -12,6 +12,7 @@ import math
 import random
 import shutil
 import statistics
+import struct
 import subprocess
 import time
 from pathlib import Path
@@ -75,13 +76,15 @@ class DryRunTransport(Transport):
                 "loss_pct": round(loss, 2), "duration_s": duration_s, "backend": "dry-run"}
 
     def inject_video_load(self, mbps: float, duration_s: float) -> dict:
-        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "dry-run"}
+        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "dry-run", "live": True}
 
     def probe_control_latency(self, hz: float, seconds: float, payload: int) -> dict:
         n = max(1, int(hz * seconds))
         # Baseline ~12 ms + load-independent jitter in dry-run (load effect added by runner).
         samples = [12.0 + self.rng.uniform(-2, 4) for _ in range(n)]
-        return {"samples_ms": samples, "backend": "dry-run"}
+        return {"samples_ms": samples, "backend": "dry-run", "mode": "dry-run",
+                "measured": True, "metric": "synthetic_ms", "sent": n, "matched": n,
+                "timeouts": 0, "delivery_rate": 1.0, "actual_hz": hz}
 
 
 class MockTransport(Transport):
@@ -101,7 +104,7 @@ class MockTransport(Transport):
 
     def inject_video_load(self, mbps: float, duration_s: float) -> dict:
         self._video_mbps = mbps
-        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "mock"}
+        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "mock", "live": True}
 
     def probe_control_latency(self, hz: float, seconds: float, payload: int) -> dict:
         n = max(1, int(hz * seconds))
@@ -109,7 +112,9 @@ class MockTransport(Transport):
         load = self._video_mbps / self.capacity
         base = 8.0 + (120.0 if load > 0.85 else 25.0 * load)
         samples = [max(1.0, base + self.rng.gauss(0, 3 + 10 * load)) for _ in range(n)]
-        return {"samples_ms": samples, "backend": "mock", "video_mbps": self._video_mbps}
+        return {"samples_ms": samples, "backend": "mock", "mode": "mock",
+                "measured": True, "metric": "synthetic_ms", "video_mbps": self._video_mbps,
+                "sent": n, "matched": n, "timeouts": 0, "delivery_rate": 1.0, "actual_hz": hz}
 
 
 def parse_iperf3_json(payload: Union[str, bytes, dict]) -> dict:
@@ -151,20 +156,30 @@ def parse_iperf3_json(payload: Union[str, bytes, dict]) -> dict:
     }
 
 
+PROBE_MAGIC = b"N7P1"
+PROBE_HDR = struct.Struct("!4sI")  # magic + seq
+
+
 class Iperf3Transport(Transport):
     """Lab adapter: subprocess `iperf3 -J` or offline JSON (no RF code).
 
-    Unit tests exercise `parse_iperf3_json` only. Live runs need `iperf3` on PATH
-    and a reachable `-s` on `terminal_host`. Pass `json_dir` to replay saved reports.
+    Offline (`run_subprocess=False`) only reads saved JSON — no sockets, no
+    subprocess. Live mode needs `iperf3` on PATH and a reachable echo/iperf server.
     """
 
     def __init__(self, cfg: BenchConfig, json_dir: Optional[Path] = None,
-                 run_subprocess: bool = True):
+                 run_subprocess: bool = True, echo_timeout_s: float = 0.05):
         self.cfg = cfg
         self.json_dir = Path(json_dir) if json_dir else None
         self.run_subprocess = run_subprocess
+        self.echo_timeout_s = echo_timeout_s
         self._video_proc: Optional[subprocess.Popen] = None
         self._video_mbps = 0.0
+        self._video_live = False
+
+    @property
+    def offline(self) -> bool:
+        return not self.run_subprocess
 
     def _cmd(self, mbps: float, duration_s: float) -> List[str]:
         return [
@@ -181,10 +196,11 @@ class Iperf3Transport(Transport):
                 row["offered_mbps"] = mbps
                 row["duration_s"] = duration_s
                 row["source"] = str(path)
+                row["mode"] = "offline" if self.offline else "live-or-cache"
                 return row
-        if not self.run_subprocess:
+        if self.offline:
             raise FileNotFoundError(
-                f"No offline JSON at {self.json_dir} and subprocess disabled"
+                f"Offline mode: missing {self.json_dir}/iperf-{mbps:g}M.json"
             )
         if not shutil.which("iperf3"):
             raise FileNotFoundError(
@@ -201,60 +217,144 @@ class Iperf3Transport(Transport):
         row["offered_mbps"] = mbps
         row["duration_s"] = duration_s
         row["backend"] = "iperf3"
+        row["mode"] = "live"
         row["cmd"] = " ".join(cmd)
         return row
 
     def inject_video_load(self, mbps: float, duration_s: float) -> dict:
         self._video_mbps = mbps
-        if self.json_dir and not self.run_subprocess:
+        if self.offline:
+            self._video_live = False
             return {"offered_mbps": mbps, "duration_s": duration_s,
-                    "backend": "iperf3-json-offline", "note": "no live flood"}
+                    "backend": "iperf3-json-offline", "live": False,
+                    "note": "offline: no live video flood"}
         if not shutil.which("iperf3"):
             raise FileNotFoundError("iperf3 not on PATH for video inject")
         cmd = self._cmd(mbps, duration_s)
-        # Background flood; control probe runs concurrently in DeviceBench.
         self._video_proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self._video_live = True
         return {"offered_mbps": mbps, "duration_s": duration_s,
-                "backend": "iperf3", "pid": self._video_proc.pid, "cmd": " ".join(cmd)}
+                "backend": "iperf3", "live": True,
+                "pid": self._video_proc.pid, "cmd": " ".join(cmd)}
 
     def probe_control_latency(self, hz: float, seconds: float, payload: int) -> dict:
-        """Paced UDP send timestamps only (one-way send pacing / local RTT if echo).
+        """Measure RTT to an echo peer using sequenced UDP probes.
 
-        Without a module echo service this records inter-send jitter as a stand-in
-        so the report pipeline stays identical; lab should replace with PPS-aligned
-        two-ended capture when available.
+        Timeouts are losses, not latency samples. Offline mode never opens a socket.
+        Metric is RTT (requires echo); not one-way delay without clock sync.
         """
-        import socket
         n = max(1, int(hz * seconds))
+        if self.offline:
+            path = self.json_dir / "control-latency.json" if self.json_dir else None
+            if path and path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data.setdefault("measured", True)
+                data.setdefault("mode", "offline")
+                data.setdefault("metric", "rtt_ms")
+                data["source"] = str(path)
+                return data
+            return {
+                "samples_ms": [],
+                "backend": "offline-not-measured",
+                "mode": "offline",
+                "measured": False,
+                "metric": "rtt_ms",
+                "sent": 0,
+                "matched": 0,
+                "timeouts": 0,
+                "bad_echo": 0,
+                "late": 0,
+                "delivery_rate": 0.0,
+                "actual_hz": 0.0,
+                "video_mbps": self._video_mbps,
+                "note": "offline mode does not send UDP; provide control-latency.json to replay",
+            }
+
+        import socket
+        import select
+
         interval = 1.0 / hz if hz > 0 else 0.02
-        body = bytes([0xA5]) * max(1, payload)
-        samples = []
+        pad_len = max(0, payload - PROBE_HDR.size)
+        pad = bytes([0xA5]) * pad_len
+        addr = (self.cfg.terminal_host, self.cfg.control_port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(0.05)
+        sock.setblocking(False)
+        pending: Dict[int, float] = {}
+        samples: List[float] = []
+        timeouts = matched = bad_echo = late = 0
+        sent = 0
+        t_start = time.perf_counter()
+        next_send = t_start
         try:
-            addr = (self.cfg.terminal_host, self.cfg.control_port)
-            for _ in range(n):
-                t0 = time.perf_counter()
-                try:
-                    sock.sendto(body, addr)
+            while sent < n or pending:
+                now = time.perf_counter()
+                for seq, t_send in list(pending.items()):
+                    if now - t_send > self.echo_timeout_s:
+                        del pending[seq]
+                        timeouts += 1
+                readable, _, _ = select.select([sock], [], [], 0.001)
+                if readable:
+                    while True:
+                        try:
+                            data, src = sock.recvfrom(2048)
+                        except BlockingIOError:
+                            break
+                        if src[0] != addr[0] or src[1] != addr[1]:
+                            bad_echo += 1
+                            continue
+                        if len(data) < PROBE_HDR.size:
+                            bad_echo += 1
+                            continue
+                        magic, seq = PROBE_HDR.unpack_from(data)
+                        if magic != PROBE_MAGIC:
+                            bad_echo += 1
+                            continue
+                        t_send = pending.pop(seq, None)
+                        if t_send is None:
+                            late += 1
+                            continue
+                        samples.append((time.perf_counter() - t_send) * 1000.0)
+                        matched += 1
+                if sent < n and now >= next_send:
+                    pkt = PROBE_HDR.pack(PROBE_MAGIC, sent) + pad
                     try:
-                        sock.recvfrom(2048)
-                        samples.append((time.perf_counter() - t0) * 1000.0)
-                    except socket.timeout:
-                        # No echo: use schedule adherence as soft latency proxy.
-                        samples.append((time.perf_counter() - t0) * 1000.0)
-                except OSError:
-                    samples.append(float("nan"))
-                elapsed = time.perf_counter() - t0
-                time.sleep(max(0.0, interval - elapsed))
+                        sock.sendto(pkt, addr)
+                        pending[sent] = time.perf_counter()
+                        sent += 1
+                        next_send = t_start + sent * interval
+                    except OSError:
+                        timeouts += 1
+                        sent += 1
+                        next_send = t_start + sent * interval
+                if sent >= n and not pending:
+                    break
+                if time.perf_counter() - t_start > seconds + self.echo_timeout_s + 1.0:
+                    timeouts += len(pending)
+                    pending.clear()
+                    break
         finally:
             sock.close()
             if self._video_proc and self._video_proc.poll() is None:
                 self._video_proc.terminate()
-        finite = [x for x in samples if math.isfinite(x)]
-        return {"samples_ms": finite, "backend": "udp-probe",
-                "video_mbps": self._video_mbps, "sent": n, "echo_or_local": len(finite)}
+        elapsed = max(time.perf_counter() - t_start, 1e-9)
+        delivery = (matched / sent) if sent else 0.0
+        return {
+            "samples_ms": samples,
+            "backend": "udp-rtt-probe",
+            "mode": "live",
+            "measured": matched > 0,
+            "metric": "rtt_ms",
+            "sent": sent,
+            "matched": matched,
+            "timeouts": timeouts,
+            "bad_echo": bad_echo,
+            "late": late,
+            "delivery_rate": round(delivery, 4),
+            "actual_hz": round(sent / elapsed, 2),
+            "video_mbps": self._video_mbps,
+            "video_live": self._video_live,
+        }
 
     def close(self):
         if self._video_proc and self._video_proc.poll() is None:
@@ -308,26 +408,57 @@ class DeviceBench:
                           notes="Application goodput vs offered; find saturation knee.")
 
     def run_video_plus_control(self) -> StepResult:
-        self.transport.inject_video_load(self.cfg.video_inject_mbps, self.cfg.control_seconds)
+        inject = self.transport.inject_video_load(
+            self.cfg.video_inject_mbps, self.cfg.control_seconds)
         raw = self.transport.probe_control_latency(
             self.cfg.control_hz, self.cfg.control_seconds, self.cfg.control_payload_bytes)
-        stats = _latency_stats(raw["samples_ms"])
-        ok = stats["n"] > 0 and stats["p99_ms"] < 250
-        return StepResult("video_plus_control", ok,
-                          {"video_mbps": self.cfg.video_inject_mbps, "control": stats,
-                           "backend": raw.get("backend")},
-                          notes="Control latency under video full-load inject (§6.2 QoS).")
+        stats = _latency_stats(raw.get("samples_ms") or [])
+        measured = bool(raw.get("measured", stats["n"] > 0))
+        delivery = float(raw.get("delivery_rate", 1.0 if measured else 0.0))
+        live_video = bool(inject.get("live", True))
+        # Full-load control claim requires a live video inject + real RTT samples.
+        ok = (
+            measured
+            and live_video
+            and stats["n"] > 0
+            and delivery >= 0.9
+            and stats["p99_ms"] < 250
+        )
+        status = "pass" if ok else ("not_measured" if not measured else "fail")
+        return StepResult(
+            "video_plus_control", ok,
+            {"video_mbps": self.cfg.video_inject_mbps, "control": stats,
+             "probe": {k: raw[k] for k in (
+                 "backend", "mode", "measured", "metric", "sent", "matched",
+                 "timeouts", "bad_echo", "late", "delivery_rate", "actual_hz",
+                 "video_live", "note") if k in raw},
+             "inject": inject, "status": status},
+            notes=("Control RTT under live video inject (§6.2). "
+                   "Timeouts count as loss; offline/not-measured cannot pass."),
+        )
 
     def run_control_distribution(self) -> StepResult:
-        # Idle control baseline (no video).
         if hasattr(self.transport, "_video_mbps"):
             self.transport._video_mbps = 0.0
+        if hasattr(self.transport, "_video_live"):
+            self.transport._video_live = False
         raw = self.transport.probe_control_latency(
             self.cfg.control_hz, self.cfg.control_seconds, self.cfg.control_payload_bytes)
-        stats = _latency_stats(raw["samples_ms"])
-        return StepResult("control_distribution", stats["n"] > 0,
-                          {"control": stats, "backend": raw.get("backend")},
-                          notes="Idle control latency distribution for comparison.")
+        stats = _latency_stats(raw.get("samples_ms") or [])
+        measured = bool(raw.get("measured", stats["n"] > 0))
+        delivery = float(raw.get("delivery_rate", 1.0 if measured else 0.0))
+        ok = measured and stats["n"] > 0 and delivery >= 0.9
+        status = "pass" if ok else ("not_measured" if not measured else "fail")
+        return StepResult(
+            "control_distribution", ok,
+            {"control": stats,
+             "probe": {k: raw[k] for k in (
+                 "backend", "mode", "measured", "metric", "sent", "matched",
+                 "timeouts", "bad_echo", "late", "delivery_rate", "actual_hz",
+                 "note") if k in raw},
+             "status": status},
+            notes="Idle control RTT distribution; not measured offline without saved JSON.",
+        )
 
     def run_all(self) -> dict:
         steps = [
@@ -335,9 +466,12 @@ class DeviceBench:
             self.run_control_distribution(),
             self.run_video_plus_control(),
         ]
+        mode = self.cfg.mode
+        if isinstance(self.transport, Iperf3Transport):
+            mode = "offline" if self.transport.offline else "iperf3-live"
         return {
             "config": {
-                "mode": self.cfg.mode,
+                "mode": mode,
                 "center_host": self.cfg.center_host,
                 "terminal_host": self.cfg.terminal_host,
                 "iperf_steps_mbps": list(self.cfg.iperf_steps_mbps),
@@ -345,6 +479,10 @@ class DeviceBench:
             },
             "steps": [asdict(s) for s in steps],
             "all_ok": all(s.ok for s in steps),
+            "all_measured": all(
+                (s.metrics.get("status") != "not_measured") for s in steps
+                if "status" in s.metrics
+            ),
         }
 
 

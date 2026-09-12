@@ -12,6 +12,7 @@ from typing import Dict, Optional, Set
 # node_id(u16) + seq(u32) + timestamp_ms(u64) + mac(16)
 AUTH_TRAILER = struct.Struct("!HIQ16s")
 AUTH_SIZE = AUTH_TRAILER.size
+SEQ_MASK = 0xFFFFFFFF
 
 
 @dataclass
@@ -21,7 +22,7 @@ class AuthConfig:
     # production must inject from env/HSM — never commit real secrets.
     secret: bytes = b"nebula-mvp-dev-only-not-for-production"
     max_skew_ms: int = 2000
-    # How many recent seq numbers to remember per node for replay detection.
+    # Sliding window size (highest seq + bitmap of recent accepts).
     window: int = 64
 
 
@@ -29,11 +30,51 @@ class AuthError(ValueError):
     pass
 
 
+class _ReplayWindow:
+    """Highest-seen sequence plus a bitmap of the last `size` sequence numbers.
+
+    Bit 0 marks `highest`; bit i marks `highest - i`. Packets below the lower
+    bound are rejected; duplicates inside the window are rejected. A jump ahead
+    larger than the window resets the bitmap to only the new sequence (catch-up
+    after loss). Call `AuthGateway.begin_session` after a deliberate reboot/rekey
+    so old-session packets cannot be accepted again.
+    """
+
+    def __init__(self, size: int):
+        self.size = size
+        self.highest: Optional[int] = None
+        self.bitmap: int = 0
+
+    def accept(self, seq: int):
+        seq &= SEQ_MASK
+        if self.highest is None:
+            self.highest = seq
+            self.bitmap = 1
+            return
+        ahead = (seq - self.highest) & SEQ_MASK
+        if 0 < ahead < (SEQ_MASK // 2):
+            if ahead >= self.size:
+                self.highest = seq
+                self.bitmap = 1
+            else:
+                self.bitmap = ((self.bitmap << ahead) | 1) & ((1 << self.size) - 1)
+                self.highest = seq
+            return
+        if ahead == 0:
+            raise AuthError("replay")
+        back = (self.highest - seq) & SEQ_MASK
+        if back >= self.size or back >= (SEQ_MASK // 2):
+            raise AuthError("replay")
+        bit = 1 << back
+        if self.bitmap & bit:
+            raise AuthError("replay")
+        self.bitmap |= bit
+
+
 class AuthGateway:
     def __init__(self, config: Optional[AuthConfig] = None):
         self.config = config or AuthConfig()
-        # node_id -> set of recent seq, and last timestamp
-        self._seen_seq: Dict[int, Set[int]] = {}
+        self._windows: Dict[int, _ReplayWindow] = {}
         self._last_ts: Dict[int, int] = {}
 
     def allow(self, node_id: int):
@@ -41,7 +82,12 @@ class AuthGateway:
 
     def revoke(self, node_id: int):
         self.config.whitelist.discard(node_id)
-        self._seen_seq.pop(node_id, None)
+        self._windows.pop(node_id, None)
+        self._last_ts.pop(node_id, None)
+
+    def begin_session(self, node_id: int):
+        """Clear replay state after a deliberate reboot / rekey (new session)."""
+        self._windows.pop(node_id, None)
         self._last_ts.pop(node_id, None)
 
     def _mac(self, node_id: int, seq: int, ts_ms: int, body: bytes) -> bytes:
@@ -54,7 +100,7 @@ class AuthGateway:
             raise AuthError("node not on whitelist")
         ts = int(now_ms if now_ms is not None else time.time() * 1000)
         tag = self._mac(node_id, seq, ts, body)
-        return body + AUTH_TRAILER.pack(node_id, seq, ts, tag)
+        return body + AUTH_TRAILER.pack(node_id, seq & SEQ_MASK, ts, tag)
 
     def open(self, blob: bytes, now_ms: Optional[int] = None) -> tuple:
         """Return (node_id, seq, body). Raises AuthError on failure."""
@@ -70,16 +116,10 @@ class AuthGateway:
         now = int(now_ms if now_ms is not None else time.time() * 1000)
         if abs(now - ts) > self.config.max_skew_ms:
             raise AuthError("timestamp skew")
-        seen = self._seen_seq.setdefault(node_id, set())
-        if seq in seen:
-            raise AuthError("replay")
         last = self._last_ts.get(node_id)
         if last is not None and ts + self.config.max_skew_ms < last:
             raise AuthError("timestamp rewind")
-        seen.add(seq)
-        if len(seen) > self.config.window:
-            # Drop arbitrary old ids — window is a bound, not a strict bitmap.
-            for old in list(seen)[: len(seen) - self.config.window]:
-                seen.discard(old)
+        window = self._windows.setdefault(node_id, _ReplayWindow(self.config.window))
+        window.accept(seq)
         self._last_ts[node_id] = max(ts, last or ts)
         return node_id, seq, body
