@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>图数遥 · 融合链路实验台</title><link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/" aria-label="首页"><span class="brand-mark">N<span>7</span></span><span>LINK LAB<span class="brand-sub">图数遥融合传输原型</span></span></a><div class="connection"><i id="connectionDot"></i><span id="connectionText">正在连接本机服务</span><span class="local-tag">LOCAL UDP</span></div></header>
+  <main>
+    <section class="intro"><div><p class="eyebrow">VIDEO · TELEMETRY · CONTROL</p><h1>一条链路，三种实时业务。</h1><p class="subtitle">压低带宽，观察视频如何让出资源，让遥控保持新鲜。</p></div><div class="intro-note"><span>单机模拟实验</span><strong>不代表 NEBULA-7 实机性能</strong></div></section>
+    <section class="path" aria-label="链路结构"><div><span class="node-dot air"></span><b>AIR</b><span>画面 / 遥测</span></div><span class="path-arrow">⇄</span><div class="bottleneck"><span class="node-dot"></span><b>SHARED LINK</b><span id="pathCapacity">1.5 Mbps</span></div><span class="path-arrow">⇄</span><div><span class="node-dot ground"></span><b>GROUND</b><span>遥控 / 显示</span></div><span class="path-caption">双向共用带宽预算</span></section>
+    <div id="error" class="error" role="alert" hidden></div>
+    <section class="kpis" aria-label="最近五秒指标">
+      <article class="kpi"><div class="kpi-label"><span class="dot control"></span>遥控 P99 <span>最近 5 秒</span></div><div class="kpi-value"><strong id="controlP99">—</strong><span>ms</span></div><div class="kpi-foot">P50 <b id="controlP50">—</b> · P95 <b id="controlP95">—</b> ms</div></article>
+      <article class="kpi"><div class="kpi-label"><span class="dot data"></span>遥测 P95 <span>10 Hz 生成</span></div><div class="kpi-value"><strong id="dataP95">—</strong><span>ms</span></div><div class="kpi-foot">平均排队 <b id="dataQueue">—</b> ms</div></article>
+      <article class="kpi"><div class="kpi-label"><span class="dot video"></span>有效视频帧率 <span>完整帧重组</span></div><div class="kpi-value"><strong id="videoFps">—</strong><span>FPS</span></div><div class="kpi-foot">丢帧 <b id="frameDrops">0</b> · 丢弃率 <b id="dropRate">0%</b> · 高清 <b id="fullShare">—</b></div></article>
+      <article class="kpi"><div class="kpi-label">链路发送速率 <span>含 UDP / IP 开销</span></div><div class="kpi-value"><strong id="wireRate">—</strong><span>Mbps</span></div><div class="kpi-foot">视频占用 <b id="videoRate">—</b> Mbps</div></article>
+    </section>
+    <div class="workspace">
+      <div class="main-column">
+        <section class="panel video-panel"><div class="panel-head"><h2><span class="dot video"></span>机载画面</h2><div class="head-tools"><span id="sourceLabel" class="muted">合成测试画面</span><button id="sourceSwitch" class="text-button">开启摄像头</button></div></div>
+          <div class="video-stage" id="videoStage" tabindex="0" aria-label="视频画面，点击后使用 W S A D 和方向键控制"><img id="videoImage" src="/stream" alt="经受限链路传输并重组的机载画面"><div class="video-empty" id="videoEmpty">等待首个完整视频帧<span>JPEG → 分片 → 受限链路 → 重组</span></div><div class="video-overlay"><span><i></i>RECEIVED AT GROUND</span><span id="frameLabel">FRAME —</span></div><div class="video-bottom"><span id="frameFormat">640 × 360 / JPEG</span><span>画面年龄 <b id="frameAge">—</b> ms</span></div></div>
+          <p class="panel-note" id="sourceWarning">默认使用合成画面。切换摄像头后，图像仍经过同一条模拟链路。</p>
+        </section>
+        <section class="panel"><div class="panel-head"><h2><span class="dot data"></span>机载遥测</h2><span class="status" id="telemetryStatus">等待数据</span></div><div class="telemetry-grid"><div><span>高度</span><strong id="altitude">—</strong><small>m</small></div><div><span>速度</span><strong id="speed">—</strong><small>m/s</small></div><div><span>电量</span><strong id="battery">—</strong><small>%</small></div><div><span>航向</span><strong id="heading">—</strong><small>°</small></div></div><div class="telemetry-footer"><span>LAT <b id="latitude">—</b> &nbsp; LON <b id="longitude">—</b></span><span>数据年龄 <b id="telemetryAge">—</b> ms</span></div></section>
+        <section class="panel charts-panel"><div class="panel-head"><h2>拥塞响应</h2><span class="muted">最近 60 秒 · 每 0.5 秒采样</span></div><div class="chart-label"><span><i class="dot control"></i>遥控 P99</span><span>ms</span></div><canvas id="latencyChart" aria-label="遥控延迟趋势" role="img"></canvas><div class="chart-label"><span><i class="dot video"></i>有效视频帧率</span><span>FPS</span></div><canvas id="fpsChart" aria-label="视频帧率趋势" role="img"></canvas><div class="chart-footer"><span>60 秒前</span><span>现在</span></div></section>
+      </div>
+      <aside class="side-column">
+        <section class="panel settings-panel"><div class="panel-head"><h2>链路实验设置</h2><span class="pill">实时生效</span></div>
+          <label class="field-title">调度模式</label><div class="mode-switch"><button id="fusionMode" class="selected" aria-pressed="true">FUSION <small>新鲜度优先</small></button><button id="naiveMode" aria-pressed="false">FIFO <small>按到达顺序</small></button></div><p id="modeDescription" class="description">遥控最新值 → 遥测有界队列 → 视频帧队列</p>
+          <label class="field-title">视频编码</label><div class="mode-switch"><button id="layeredOn" class="selected" aria-pressed="true">分层 <small>基础层 + 自适应高清</small></button><button id="layeredOff" aria-pressed="false">单层 <small>固定 640×360</small></button></div><p id="layerDescription" class="description">基础层 160×90 每帧必发，高清层按剩余容量选档</p>
+          <label class="field-title">高清层 FEC</label><div class="mode-switch"><button id="fecOn" class="selected" aria-pressed="true">开启 <small>按实测丢包配冗余</small></button><button id="fecOff" aria-pressed="false">关闭 <small>丢一片即丢整帧</small></button></div><p id="fecDescription" class="description">未测到丢包，不发冗余包</p>
+          <div class="range-label"><label for="capacity">总链路容量</label><output id="capacityValue">1.5 Mbps</output></div><input id="capacity" type="range" min="100" max="10000" step="100" value="1500"><div class="presets"><button data-kbps="5000">5 Mbps</button><button data-kbps="1500">1.5 Mbps</button><button data-kbps="500">500 kbps</button><button data-kbps="200">200 kbps</button></div>
+          <div class="range-label"><label for="delay">单程传播时延</label><output id="delayValue">20 ms</output></div><input id="delay" type="range" min="0" max="200" step="1" value="20">
+          <div class="range-label"><label for="jitter">随机抖动 ±</label><output id="jitterValue">5 ms</output></div><input id="jitter" type="range" min="0" max="100" step="1" value="5">
+          <div class="range-label"><label for="loss">随机包丢失</label><output id="lossValue">0%</output></div><input id="loss" type="range" min="0" max="10" step="0.25" value="0">
+          <div class="range-label"><label for="lossBurst">丢包突发长度</label><output id="lossBurstValue">独立丢包</output></div><input id="lossBurst" type="range" min="1" max="20" step="1" value="1">
+          <div class="queue-box"><span>等待发送</span><strong id="queueLabel">C 0 · D 0 · V 0 帧</strong></div><p class="panel-note">模式切换会清空等待队列。延迟取最近 5 秒样本，切换后需等待窗口更新。</p>
+        </section>
+        <section class="panel control-panel"><div class="panel-head"><h2><span class="dot control"></span>遥控输入</h2><span class="muted">50 Hz 发送</span></div><div class="control-instruction">点击画面后使用键盘，或按住下方按钮。</div><div class="key-groups"><div><span>油门 / 偏航</span><div class="key-row"><button data-key="KeyW" aria-label="增加油门">W</button></div><div class="key-row"><button data-key="KeyA" aria-label="左偏航">A</button><button data-key="KeyS" aria-label="降低油门">S</button><button data-key="KeyD" aria-label="右偏航">D</button></div></div><div><span>俯仰 / 横滚</span><div class="key-row"><button data-key="ArrowUp" aria-label="增加俯仰">↑</button></div><div class="key-row"><button data-key="ArrowLeft" aria-label="左横滚">←</button><button data-key="ArrowDown" aria-label="降低俯仰">↓</button><button data-key="ArrowRight" aria-label="右横滚">→</button></div></div></div><div class="axis-head"><span>控制量</span><span>地面输入 / 机载执行</span></div><div id="axes"></div><button id="neutral" class="neutral-button">回到中立 <kbd>Space</kbd></button><p class="panel-note">机载值来自回传遥测。窗口失焦时输入归中；超过 500 ms 的控制状态不会用于模拟运动。</p></section>
+      </aside>
+    </div>
+    <footer><span>NEBULA MVP / 算法验证 · 单节点 · 共享半双工模型</span><span id="packetCount">已接收 0 个数据包</span><span>CSV / JSON 指标自动写入 artifacts</span></footer>
+  </main><script src="/app.js"></script>
+</body></html>
