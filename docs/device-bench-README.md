@@ -25,5 +25,6 @@ python -m nebula_mvp.device_bench --mode iperf3 --json-dir path/to/json --output
 2. 终端：`iperf3 -s`；地面 live：`python -m nebula_mvp.device_bench --mode iperf3 …`。
 3. 控制探测：对端需回显探测包（magic `N7P1` + seq）；报告为 RTT，超时计丢失，零回包不能 PASS。
 4. 无回显时步骤为 FAIL/`not_measured`，不会用超时等待冒充时延。
+5. 视频注入进程立刻退出或未启动时，满载控制步骤为 `not_measured`，不能宣称已测满载时延。
 
 代码：`nebula_mvp/device_bench.py`（`parse_iperf3_json` / `Iperf3Transport`）。

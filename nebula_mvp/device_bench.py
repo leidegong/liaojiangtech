@@ -76,7 +76,8 @@ class DryRunTransport(Transport):
                 "loss_pct": round(loss, 2), "duration_s": duration_s, "backend": "dry-run"}
 
     def inject_video_load(self, mbps: float, duration_s: float) -> dict:
-        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "dry-run", "live": True}
+        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "dry-run",
+                "live": True, "started": True}
 
     def probe_control_latency(self, hz: float, seconds: float, payload: int) -> dict:
         n = max(1, int(hz * seconds))
@@ -104,7 +105,8 @@ class MockTransport(Transport):
 
     def inject_video_load(self, mbps: float, duration_s: float) -> dict:
         self._video_mbps = mbps
-        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "mock", "live": True}
+        return {"offered_mbps": mbps, "duration_s": duration_s, "backend": "mock",
+                "live": True, "started": True}
 
     def probe_control_latency(self, hz: float, seconds: float, payload: int) -> dict:
         n = max(1, int(hz * seconds))
@@ -226,17 +228,36 @@ class Iperf3Transport(Transport):
         if self.offline:
             self._video_live = False
             return {"offered_mbps": mbps, "duration_s": duration_s,
-                    "backend": "iperf3-json-offline", "live": False,
+                    "backend": "iperf3-json-offline", "live": False, "started": False,
                     "note": "offline: no live video flood"}
         if not shutil.which("iperf3"):
-            raise FileNotFoundError("iperf3 not on PATH for video inject")
+            self._video_live = False
+            return {"offered_mbps": mbps, "duration_s": duration_s,
+                    "backend": "iperf3", "live": False, "started": False,
+                    "note": "iperf3 not on PATH for video inject"}
         cmd = self._cmd(mbps, duration_s)
         self._video_proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.perf_counter() + 0.2
+        while time.perf_counter() < deadline:
+            rc = self._video_proc.poll()
+            if rc is not None:
+                err = ""
+                if self._video_proc.stderr:
+                    err = (self._video_proc.stderr.read() or "")[:200]
+                self._video_live = False
+                return {"offered_mbps": mbps, "duration_s": duration_s,
+                        "backend": "iperf3", "live": False, "started": False,
+                        "returncode": rc, "cmd": " ".join(cmd),
+                        "note": f"video load exited immediately ({rc}): {err}"}
+            time.sleep(0.02)
         self._video_live = True
         return {"offered_mbps": mbps, "duration_s": duration_s,
-                "backend": "iperf3", "live": True,
+                "backend": "iperf3", "live": True, "started": True,
                 "pid": self._video_proc.pid, "cmd": " ".join(cmd)}
+
+    def video_load_running(self) -> bool:
+        return self._video_proc is not None and self._video_proc.poll() is None
 
     def probe_control_latency(self, hz: float, seconds: float, payload: int) -> dict:
         """Measure RTT to an echo peer using sequenced UDP probes.
@@ -408,23 +429,39 @@ class DeviceBench:
                           notes="Application goodput vs offered; find saturation knee.")
 
     def run_video_plus_control(self) -> StepResult:
-        inject = self.transport.inject_video_load(
-            self.cfg.video_inject_mbps, self.cfg.control_seconds)
+        try:
+            inject = self.transport.inject_video_load(
+                self.cfg.video_inject_mbps, self.cfg.control_seconds)
+        except Exception as exc:
+            return StepResult(
+                "video_plus_control", False,
+                {"video_mbps": self.cfg.video_inject_mbps, "status": "not_measured",
+                 "inject": {"live": False, "started": False, "error": str(exc)}},
+                notes="Video load failed to start; cannot claim full-load control RTT.",
+            )
+        if hasattr(self.transport, "video_load_running") and not self.transport.video_load_running():
+            inject = {**inject, "live": False, "started": False,
+                      "note": inject.get("note", "video load is not running")}
+        # Missing keys default to False — do not treat a failed inject as live.
+        video_started = bool(inject.get("started")) and bool(inject.get("live"))
         raw = self.transport.probe_control_latency(
             self.cfg.control_hz, self.cfg.control_seconds, self.cfg.control_payload_bytes)
         stats = _latency_stats(raw.get("samples_ms") or [])
         measured = bool(raw.get("measured", stats["n"] > 0))
         delivery = float(raw.get("delivery_rate", 1.0 if measured else 0.0))
-        live_video = bool(inject.get("live", True))
-        # Full-load control claim requires a live video inject + real RTT samples.
         ok = (
-            measured
-            and live_video
+            video_started
+            and measured
             and stats["n"] > 0
             and delivery >= 0.9
             and stats["p99_ms"] < 250
         )
-        status = "pass" if ok else ("not_measured" if not measured else "fail")
+        if not video_started or not measured:
+            status = "not_measured"
+        elif ok:
+            status = "pass"
+        else:
+            status = "fail"
         return StepResult(
             "video_plus_control", ok,
             {"video_mbps": self.cfg.video_inject_mbps, "control": stats,
@@ -434,7 +471,7 @@ class DeviceBench:
                  "video_live", "note") if k in raw},
              "inject": inject, "status": status},
             notes=("Control RTT under live video inject (§6.2). "
-                   "Timeouts count as loss; offline/not-measured cannot pass."),
+                   "Timeouts count as loss; failed/offline video load cannot pass."),
         )
 
     def run_control_distribution(self) -> StepResult:

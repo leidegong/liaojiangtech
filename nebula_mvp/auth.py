@@ -36,8 +36,8 @@ class _ReplayWindow:
     Bit 0 marks `highest`; bit i marks `highest - i`. Packets below the lower
     bound are rejected; duplicates inside the window are rejected. A jump ahead
     larger than the window resets the bitmap to only the new sequence (catch-up
-    after loss). Call `AuthGateway.begin_session` after a deliberate reboot/rekey
-    so old-session packets cannot be accepted again.
+    after loss). `AuthGateway.begin_session` increments the MAC epoch so
+    previously sealed packets cannot be replayed after a reset.
     """
 
     def __init__(self, size: int):
@@ -76,6 +76,7 @@ class AuthGateway:
         self.config = config or AuthConfig()
         self._windows: Dict[int, _ReplayWindow] = {}
         self._last_ts: Dict[int, int] = {}
+        self._epoch: Dict[int, int] = {}
 
     def allow(self, node_id: int):
         self.config.whitelist.add(node_id)
@@ -84,14 +85,24 @@ class AuthGateway:
         self.config.whitelist.discard(node_id)
         self._windows.pop(node_id, None)
         self._last_ts.pop(node_id, None)
+        self._epoch.pop(node_id, None)
 
     def begin_session(self, node_id: int):
-        """Clear replay state after a deliberate reboot / rekey (new session)."""
+        """Start a new session after reboot / rekey.
+
+        Increments the per-node epoch bound into the MAC so previously sealed
+        packets fail even if their timestamp is still inside the skew window.
+        Does not accept old-session bags after a reset.
+        """
         self._windows.pop(node_id, None)
         self._last_ts.pop(node_id, None)
+        self._epoch[node_id] = self._epoch.get(node_id, 0) + 1
 
-    def _mac(self, node_id: int, seq: int, ts_ms: int, body: bytes) -> bytes:
-        msg = struct.pack("!HIQ", node_id, seq, ts_ms) + body
+    def _mac(self, node_id: int, seq: int, ts_ms: int, body: bytes,
+             epoch: Optional[int] = None) -> bytes:
+        if epoch is None:
+            epoch = self._epoch.get(node_id, 0)
+        msg = struct.pack("!HIQI", node_id, seq, ts_ms, epoch) + body
         return hmac.new(self.config.secret, msg, hashlib.sha256).digest()[:16]
 
     def seal(self, node_id: int, seq: int, body: bytes,
@@ -110,8 +121,12 @@ class AuthGateway:
         node_id, seq, ts, tag = AUTH_TRAILER.unpack(trailer)
         if self.config.whitelist and node_id not in self.config.whitelist:
             raise AuthError("node not on whitelist")
-        expect = self._mac(node_id, seq, ts, body)
+        epoch = self._epoch.get(node_id, 0)
+        expect = self._mac(node_id, seq, ts, body, epoch)
         if not hmac.compare_digest(expect, tag):
+            for old_epoch in range(epoch):
+                if hmac.compare_digest(self._mac(node_id, seq, ts, body, old_epoch), tag):
+                    raise AuthError("stale session")
             raise AuthError("bad mac")
         now = int(now_ms if now_ms is not None else time.time() * 1000)
         if abs(now - ts) > self.config.max_skew_ms:

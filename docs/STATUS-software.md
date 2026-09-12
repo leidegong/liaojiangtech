@@ -21,8 +21,8 @@
 
 ### 项 3 / 项 6 边界（审查 a9cb9d8 后）
 
-- **设备测试台：** dry-run / mock / 离线 JSON 吞吐可跑；**live 控制探测**需回显服务，报告为 **RTT**（非单向时延）。无回包计为丢失/未测，**不得**算作成功时延。离线模式**禁止**发 UDP / 起子进程；无 `control-latency.json` 时控制步骤为 `not_measured`。
-- **防重放：** 最高序号 + 位图滑动窗口；淘汰下界以下的旧包一律拒绝。`begin_session()` 用于重启/换钥。**尚未**接入 `air_node` / `ground_node` 收发路径，不能称「链路已加密鉴权」。
+- **设备测试台：** dry-run / mock / 离线 JSON 吞吐可跑；**live 控制探测**需回显服务，报告为 **RTT**（非单向时延）。无回包计为丢失/未测，**不得**算作成功时延。离线模式**禁止**发 UDP / 起子进程；无 `control-latency.json` 时控制步骤为 `not_measured`。视频负载未成功启动（进程立刻退出 / 抛错 / `started=false`）时，满载控制步骤为 `not_measured`，不能 PASS。
+- **防重放：** 最高序号 + 位图滑动窗口；淘汰下界以下的旧包一律拒绝。`begin_session()` 会提升 MAC epoch，旧会话包即使时间戳仍有效也按 `stale session` 拒绝。**尚未**接入 `air_node` / `ground_node` 收发路径，不能称「链路已加密鉴权」。
 
 ## 第 1 项结论（决策用）
 

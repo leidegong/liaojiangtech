@@ -132,6 +132,29 @@ class DeviceBenchTests(unittest.TestCase):
             echo.close()
             thread.join(timeout=1)
 
+    def test_failed_video_inject_cannot_pass_full_load(self):
+        class DeadVideo(MockTransport):
+            def inject_video_load(self, mbps, duration_s):
+                return {"offered_mbps": mbps, "duration_s": duration_s,
+                        "backend": "mock", "live": False, "started": False,
+                        "note": "iperf3 failed to start"}
+
+        cfg = BenchConfig(mode="mock", video_inject_mbps=28, control_seconds=0.2, control_hz=20)
+        step = DeviceBench(cfg, DeadVideo(capacity_mbps=30, seed=1)).run_video_plus_control()
+        self.assertFalse(step.ok)
+        self.assertEqual(step.metrics["status"], "not_measured")
+        self.assertFalse(step.metrics["inject"]["started"])
+
+    def test_video_inject_exception_cannot_pass_full_load(self):
+        class BoomVideo(MockTransport):
+            def inject_video_load(self, mbps, duration_s):
+                raise FileNotFoundError("iperf3 not on PATH")
+
+        cfg = BenchConfig(mode="mock", video_inject_mbps=8, control_seconds=0.2, control_hz=20)
+        step = DeviceBench(cfg, BoomVideo()).run_video_plus_control()
+        self.assertFalse(step.ok)
+        self.assertEqual(step.metrics["status"], "not_measured")
+
     def test_offline_run_all_sends_no_udp(self):
         # REVIEW-a9cb9d8 P2: --json-dir must not open sockets.
         sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -282,6 +305,20 @@ class AuthTests(unittest.TestCase):
             gw.open(old[1], now_ms=1100)
         gw.begin_session(1)
         self.assertEqual(gw.open(gw.seal(1, 0, b"y", now_ms=2000), now_ms=2000)[1], 0)
+
+    def test_begin_session_rejects_old_session_bags(self):
+        gw = AuthGateway(AuthConfig(whitelist={1}, window=8, max_skew_ms=5000))
+        old = gw.seal(1, 0, b"old", now_ms=1000)
+        unused = gw.seal(1, 1, b"unused", now_ms=1000)
+        gw.open(old, now_ms=1000)
+        gw.begin_session(1)
+        with self.assertRaises(AuthError) as seen:
+            gw.open(old, now_ms=1100)
+        self.assertEqual(str(seen.exception), "stale session")
+        with self.assertRaises(AuthError) as unseen:
+            gw.open(unused, now_ms=1100)
+        self.assertEqual(str(unseen.exception), "stale session")
+        self.assertEqual(gw.open(gw.seal(1, 0, b"new", now_ms=2000), now_ms=2000)[1], 0)
 
 
 if __name__ == "__main__":
