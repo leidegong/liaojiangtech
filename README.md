@@ -108,6 +108,18 @@ Windows：`.\.venv\Scripts\python.exe -m nebula_mvp.benchmark --verify`。
 
 # 测试
 .venv/bin/python -m unittest discover -s tests -v
+
+# 多节点调度仿真（§2.6，N 可到 16+）
+.venv/bin/python -m nebula_mvp.multinode --n 16 --mbps 40 --output artifacts/cli-runs/multinode
+
+# 厂商问询函草稿（可复制发出）
+# artifacts/cli-runs/inquiry-letter.md
+
+# 真设备测试台骨架（样机未到用 dry-run/mock）
+.venv/bin/python -m nebula_mvp.device_bench --mode dry-run --output artifacts/cli-runs/device-bench
+
+# 链路预算（§2.4）
+.venv/bin/python -m nebula_mvp.link_budget --mhz 2400 --km 12 --output artifacts/cli-runs/link-budget
 ```
 
 Windows 将 `.venv/bin/python` 换成 `.\.venv\Scripts\python.exe` 即可。
@@ -160,6 +172,11 @@ HTTP 仅用于地面画面展示、观测指标、键盘输入和模拟器设置
 | `clock.py` | 全平台 `PreciseEventLoop`（绑 `perf_counter`）；Windows 另有 1 ms 定时与唤醒线程 |
 | `app.py` / `server.py` / `static/` | 生命周期、仅本机 HTTP 服务、网页界面 |
 | `benchmark.py` | 顺序执行 A/B 实验并生成报告 |
+| `multinode.py` | 1 中心 + N 终端调度层离散事件仿真（§2.6 决策场景） |
+| `device_bench.py` | 真设备测试台骨架（dry-run / mock / iperf3 适配层） |
+| `link_budget.py` | §2.4 链路预算可调参计算器 |
+| `interfaces.py` | SBUS 编解码、MAVLink 序号监测、失控保护状态机 |
+| `auth.py` | 入网白名单 + 时间戳/序号防重放 |
 
 ## 协议
 
@@ -195,4 +212,4 @@ VIDEO 与 VIDEO_BASE 的载荷前 12 字节是 `frame_id:uint32, fragment_id:uin
 
 面板延迟和速率使用最近 **5 秒**，计数器使用整个运行期。帧按采集时刻计：任一层被显示即算接收，所有层都未显示才算丢弃；帧丢弃率是 `已丢弃 / (已丢弃 + 已成功接收)`，尚在排队/在途/重组的帧不进入分母。有效 FPS 只计完整重组、JPEG 解码校验成功、按顺序新显示的采集时刻，高清层替换同一时刻的基础层不重复计数；**不是浏览器实际屏幕刷新率**。“高清占比”是新显示画面中高清层的比例；“最长冻结”是窗口内画面两次更新之间的最长间隔，包括窗口结束时仍在持续的冻结。视频延迟截至地面端把它设为当前画面：完整重组，加上分层时基础层等待高清帧的时间（2026-09-11 前只算到重组完成），不包含浏览器渲染；FPS 和最长冻结也按这个时刻统计。“画面年龄”则持续反映当前图像有多旧。
 
-严格优先级只能在控制业务本身还有足够带宽时维持低延迟；极低容量、过大传播时延或严重丢包时仍会退化。基础层 15 FPS 需要约 250 kbps，加上遥控和遥测约需 320 kbps；低于此容量时基础层也会降帧。FEC 的冗余量按独立随机丢包计算，突发丢包会击穿它：同样 5% 的平均丢包，独立丢包时救不回的高清帧 ≤1.2%，平均突发长度 2 时已达约 6%，4～8 时约 8%～10%（三个随机种子，见 `VERIFICATION.md`）；只靠加冗余要在突发 4 下保住 99%，冗余开销约需 70%，突发 16 约需 195%。长突发下画面仍靠基础层维持（≥97% 的采集帧被显示）。丢包刚开始时的最初几帧还没有冗余，这是任何按实测配置冗余的方案都有的过渡期。关闭 FEC 且有丢包时画面不会停顿，但高清帧大量丢失，画面会频繁在清晰和模糊之间切换（5% 丢包下约 35% 为高清），而且替补显示的基础层要多等一个等待期，视频延迟比有 FEC 时略高。MVP 不包含真实飞控、SBUS、MAVLink、H.264/H.265、Mesh、16 节点、射频或加密，也不支持一个浏览器操作多架无人机。
+严格优先级只能在控制业务本身还有足够带宽时维持低延迟；极低容量、过大传播时延或严重丢包时仍会退化。基础层 15 FPS 需要约 250 kbps，加上遥控和遥测约需 320 kbps；低于此容量时基础层也会降帧。FEC 的冗余量按独立随机丢包计算，突发丢包会击穿它：同样 5% 的平均丢包，独立丢包时救不回的高清帧 ≤1.2%，平均突发长度 2 时已达约 6%，4～8 时约 8%～10%（三个随机种子，见 `VERIFICATION.md`）；只靠加冗余要在突发 4 下保住 99%，冗余开销约需 70%，突发 16 约需 195%。长突发下画面仍靠基础层维持（≥97% 的采集帧被显示）。丢包刚开始时的最初几帧还没有冗余，这是任何按实测配置冗余的方案都有的过渡期。关闭 FEC 且有丢包时画面不会停顿，但高清帧大量丢失，画面会频繁在清晰和模糊之间切换（5% 丢包下约 35% 为高清），而且替补显示的基础层要多等一个等待期，视频延迟比有 FEC 时略高。单链路 UDP 仪表盘 MVP 仍是一空一地；多节点能力在 `multinode.py` 调度仿真中验证。SBUS/MAVLink/失控与鉴权为纯软件编解码与状态机（`interfaces.py` / `auth.py`），不接真实飞控或射频。不含 H.264/H.265、Mesh、OFDM/PHY。
