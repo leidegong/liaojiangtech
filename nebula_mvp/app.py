@@ -92,6 +92,8 @@ class Application:
                 "frame_size": list(self.ground.frame_size) if self.ground.frame_size else None,
                 "fec": self.air.fec, "fec_parity": self.air.last_parity,
                 "loss_estimate": self.link.loss_estimate(),
+                "burst_estimate": self.link.burst_estimate(),
+                "interleave_depth": self.link.scheduler.interleave_depth,
                 "full_wait_ms": round(self.ground.selector.wait_ns() / 1e6) if layered else None}
 
     async def command(self, path, value):

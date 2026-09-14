@@ -2,6 +2,7 @@
 import asyncio
 import random
 import time
+from .fec import interleave_depth
 from .protocol import Kind, Packet, QueuedPacket, VIDEO_KINDS
 from .scheduler import LinkClock, RateMeter, Scheduler
 
@@ -27,14 +28,17 @@ class LinkEmulator(asyncio.DatagramProtocol):
         self.priority_rate = RateMeter()
         # Rate full-resolution frames actually achieved on the air. A nominal
         # rate can overestimate goodput (on a real link: retransmissions and MAC
-        # overhead), so the budget also follows this measurement.
+        # overhead), so the budget also follows this measurement. Interleave
+        # idle is not included: that airtime is still available to the layer.
         self.full_rate = None
-        self.full_sending = None  # [frame_id, start_s, wire_bytes] of the frame on the air
         # Recent packet loss over all traffic, as a MAC would learn from
         # acknowledgements, as (sent, lost) meters over a short and a long window.
         self.loss_windows = [(RateMeter(tau), RateMeter(tau)) for tau in LOSS_WINDOWS_S]
+        # Mean burst length: lost packets / new loss runs, same two windows.
+        self.burst_windows = [(RateMeter(tau), RateMeter(tau)) for tau in LOSS_WINDOWS_S]
         self.channel_bad = False  # State of the two-state burst-loss channel.
         self.last_lost = False
+        self.full_sending = {}  # frame_id -> [bytes, busy_s] while a full frame is on the air
         self.rng = random.Random(seed)
         self.ready = asyncio.Event()
         self.transport = None
@@ -106,6 +110,7 @@ class LinkEmulator(asyncio.DatagramProtocol):
         if (config.loss, config.loss_burst) != (self.config.loss, self.config.loss_burst):
             self.channel_bad = False  # A new channel starts outside a burst.
         self.config = self.scheduler.config = config
+        self._sync_interleave()
         self.ready.set()
 
     def full_layer_budget(self, interval_s):
@@ -143,11 +148,16 @@ class LinkEmulator(asyncio.DatagramProtocol):
             self.channel_bad = self.rng.random() < loss * recover / (1 - loss)
         return self.channel_bad
 
-    def observe_loss(self, lost, now):
+    def observe_loss(self, lost, now, new_run=False):
         for sent, dropped in self.loss_windows:
             sent.add(1, now)
             if lost:
                 dropped.add(1, now)
+        if lost:
+            for packets, runs in self.burst_windows:
+                packets.add(1, now)
+                if new_run:
+                    runs.add(1, now)
 
     def loss_estimate(self):
         """Recent packet loss ratio, the worse of the two windows. None in FIFO
@@ -159,18 +169,39 @@ class LinkEmulator(asyncio.DatagramProtocol):
                   if (total := sent.rate(now)) > 0]
         return max(ratios, default=0.0)
 
+    def burst_estimate(self):
+        """Mean consecutive lost packets, the longer of the two windows.
+
+        None in FIFO mode. 1.0 when no runs have been observed (independent).
+        """
+        if self.config.mode != "fusion":
+            return None
+        now = time.perf_counter()
+        means = [packets.rate(now) / started for packets, runs in self.burst_windows
+                 if (started := runs.rate(now)) > 0]
+        return max(means, default=1.0)
+
+    def _sync_interleave(self):
+        if self.config.mode != "fusion":
+            self.scheduler.interleave_depth = 1
+            return
+        self.scheduler.interleave_depth = interleave_depth(self.burst_estimate() or 1)
+
     def _measure_full(self, item, now, serialization):
-        """Rate one full-resolution frame got while on the air, preemptions included."""
+        """Airtime rate of one full-resolution frame (own serialization only).
+
+        Interleave gaps stay available to the layer, so they must not shrink the
+        next frame's budget. `now` is kept so existing call sites still compile.
+        """
         part = item.packet.fragment()
         fid, index, count = part.frame_id, part.index, part.total
-        if index == 0 or not self.full_sending or self.full_sending[0] != fid:
-            self.full_sending = [fid, now, 0]
-        self.full_sending[2] += item.packet.wire_bytes
+        entry = self.full_sending.setdefault(fid, [0.0, 0.0])
+        entry[0] += item.packet.wire_bytes
+        entry[1] += serialization
         if index == count - 1:
-            _, start, size = self.full_sending
-            self.full_sending = None
-            if count > 1:
-                rate = size / (now + serialization - start)
+            size, busy = self.full_sending.pop(fid)
+            if count > 1 and busy > 0:
+                rate = size / busy
                 self.full_rate = rate if self.full_rate is None else .7 * self.full_rate + .3 * rate
 
     async def run(self):
@@ -182,7 +213,16 @@ class LinkEmulator(asyncio.DatagramProtocol):
             # packet that arrived during the previous transmission wins the slot.
             item = self.scheduler.pop(now_ns)
             if item is None:
-                await self.ready.wait()
+                wakeup = self.scheduler.next_wakeup_ns(now_ns)
+                if wakeup is None:
+                    await self.ready.wait()
+                else:
+                    delay = (wakeup - time.perf_counter_ns()) / 1e9
+                    if delay > 0:
+                        try:
+                            await asyncio.wait_for(self.ready.wait(), delay)
+                        except TimeoutError:
+                            pass
                 continue
             # Non-preemptive serialization on the virtual timeline. Propagation may
             # overlap later transmissions, but air->ground and ground->air never
@@ -198,10 +238,11 @@ class LinkEmulator(asyncio.DatagramProtocol):
             delay = max(0, self.config.delay_ms + self.rng.uniform(-self.config.jitter_ms,
                                                                  self.config.jitter_ms)) / 1000
             lost = self.channel_loss()
-            if lost and not self.last_lost:
+            new_run = lost and not self.last_lost
+            if new_run:
                 self.metrics.counts["link_loss_runs"] += 1
             self.last_lost = lost
-            self.observe_loss(lost, start / 1e9)
+            self.observe_loss(lost, start / 1e9, new_run)
             if lost:
                 self.metrics.drop(item, "link_loss")  # Lost packets still consume airtime.
             else:

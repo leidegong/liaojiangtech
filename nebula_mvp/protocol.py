@@ -37,21 +37,21 @@ def fragment_count(jpeg_bytes):
     return -(-jpeg_bytes // MAX_FRAGMENT_DATA)
 
 
-def video_wire_bytes(jpeg_bytes, loss=None):
+def video_wire_bytes(jpeg_bytes, loss=None, burst=None):
     """Link bytes of one fragmented JPEG plus the FEC parity sent at this
-    packet loss rate, including UDP/IP overhead."""
+    packet loss rate (and burst length, if given), including UDP/IP overhead."""
     count = fragment_count(jpeg_bytes)
-    parity = fec.parity_count(count, loss)
+    parity = fec.parity_count(count, loss, burst)
     return (jpeg_bytes + count * VIDEO_PACKET_OVERHEAD
             + parity * (min(jpeg_bytes, MAX_FRAGMENT_DATA) + VIDEO_PACKET_OVERHEAD))
 
 
-def video_payload_budget(wire_bytes, loss=None):
+def video_payload_budget(wire_bytes, loss=None, burst=None):
     """Largest JPEG whose fragments and parity fit within a link-byte budget."""
     low, high = 0, min(MAX_FRAME_BYTES, max(0, int(wire_bytes)))
     while low < high:  # Wire cost grows with JPEG size, so bisect.
         middle = (low + high + 1) // 2
-        if video_wire_bytes(middle, loss) <= wire_bytes:
+        if video_wire_bytes(middle, loss, burst) <= wire_bytes:
             low = middle
         else:
             high = middle - 1

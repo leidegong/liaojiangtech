@@ -36,6 +36,9 @@ class IntegrationTests(unittest.TestCase):
     def test_fec_keeps_full_layer_through_packet_loss(self):
         self.run_case(self.check_fec_under_loss)
 
+    def test_fec_interleave_keeps_full_layer_through_bursts(self):
+        self.run_case(self.check_fec_under_burst)
+
     async def asyncSetUp(self):
         self.app = Application(LinkConfig(capacity_bps=5_000_000, jitter_ms=0), fps=10)
         await self.app.start(port=0)
@@ -131,3 +134,14 @@ class IntegrationTests(unittest.TestCase):
         self.assertGreater(state["metrics"]["counts"].get("video_frames_recovered", 0), 0)
         # Unprotected, a 20-fragment frame survives 5% loss only 36% of the time.
         self.assertGreater(state["metrics"]["video_full_share"], .8)
+
+    async def check_fec_under_burst(self):
+        self.app.link.update({"loss": .05, "loss_burst": 8})
+        await asyncio.sleep(4)
+        self.app.check_tasks()
+        state = await self.app.state()
+        self.assertGreaterEqual(state["video"]["interleave_depth"], 2)
+        self.assertGreater(state["video"]["fec_parity"], 0)
+        self.assertGreater(state["metrics"]["counts"].get("video_frames_recovered", 0), 0)
+        # Without interleave, a mean run of 8 on a 20+4 block loses most full frames.
+        self.assertGreater(state["metrics"]["video_full_share"], .7)

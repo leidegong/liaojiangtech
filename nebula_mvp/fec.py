@@ -112,13 +112,46 @@ def _parity_for(data_count, loss_permille):
     return limit
 
 
-def parity_count(data_count, loss):
-    """Fewest parity blocks so a frame of `data_count` blocks survives i.i.d.
-    packet loss with probability >= SURVIVAL_TARGET, at most 100% overhead.
+def interleave_depth(burst):
+    """How many full-resolution frames to mix on the wire.
 
-    The loss rate is quantized to 0.1% so budgets and packetization agree.
+    Independent loss has mean run 1/(1-p) ≈ 1.05 at 5%, so values below 1.5
+    stay depth 1 (no extra delay). Moderate runs mix two frames; mean runs of
+    6 or more mix three, which is one extra capture of hold (~70 ms more at
+    15 FPS) but halves the hits of a long packet-run again. Deeper than 3
+    would hold past the 250 ms video budget.
     """
-    permille = round(loss * 1000) if loss else 0
-    if permille <= 0 or not 0 < data_count < MAX_BLOCKS:
+    if not burst or burst < 1.5:
+        return 1
+    if burst < 6:
+        return 2
+    return 3
+
+
+def _run_quantile(burst, tail=0.05):
+    """Smallest run length k with P(L > k) ≈ tail for a geometric mean `burst`."""
+    stay = 1 - 1 / burst
+    if stay <= 0:
+        return max(1, math.ceil(burst))
+    return max(1, math.ceil(math.log(tail) / math.log(stay)))
+
+
+def parity_count(data_count, loss, burst=None):
+    """Fewest parity blocks so a frame of `data_count` blocks survives the
+    modelled loss, at most 100% overhead.
+
+    `loss` is treated as i.i.d. (quantized to 0.1% so budgets and packetization
+    agree). `burst` is the mean run of consecutive losses: after mixing
+    `interleave_depth(burst)` frames, a geometric 95th-percentile run hits
+    about that many / depth fragments of one codeword. The two requirements
+    are combined; i.i.d. with no burst is unchanged.
+    """
+    if not 0 < data_count < MAX_BLOCKS:
         return 0
-    return _parity_for(data_count, min(permille, 1000))
+    permille = round(loss * 1000) if loss else 0
+    iid = _parity_for(data_count, min(permille, 1000)) if permille > 0 else 0
+    extra = 0
+    if burst and burst >= 1.5:
+        extra = math.ceil(_run_quantile(burst) / interleave_depth(burst))
+    limit = min(data_count, MAX_BLOCKS - data_count)
+    return min(limit, max(iid, extra))

@@ -1,7 +1,7 @@
 import asyncio
 import time
 from .control import Control
-from .fec import parity_count
+from .fec import interleave_depth, parity_count
 from .protocol import Kind, Packet, PacketFactory, fragment_count, video_payload_budget
 from .telemetry import SimulatedFlight
 
@@ -74,12 +74,15 @@ class AirNode(asyncio.DatagramProtocol):
         while True:
             self.frame_id += 1
             layered = self.layered
-            # One loss reading sizes both the budget and the parity actually sent.
-            loss = self.link.loss_estimate() if layered and self.fec else None
+            # One loss/burst reading sizes the budget, the parity, and interleave.
+            protect = layered and self.fec
+            loss = self.link.loss_estimate() if protect else None
+            burst = self.link.burst_estimate() if protect else None
+            self.link.scheduler.interleave_depth = interleave_depth(burst) if protect else 1
             if layered:
                 wire = self.link.full_layer_budget(1 / self.fps)
                 job = (self.source.capture_layers, self.frame_id,
-                       None if wire is None else video_payload_budget(wire, loss))
+                       None if wire is None else video_payload_budget(wire, loss, burst))
             else:
                 job = (self.source.capture, self.frame_id)
             async with self.video_lock:
@@ -94,7 +97,7 @@ class AirNode(asyncio.DatagramProtocol):
                 stamp, base, full = result
                 # The base layer carries no parity: it is the cheap floor that
                 # must fit the lowest capacities.
-                parity = parity_count(fragment_count(len(full)), loss) if full else 0
+                parity = parity_count(fragment_count(len(full)), loss, burst) if full else 0
                 layers = [(Kind.VIDEO_BASE, base, 0)] + ([(Kind.VIDEO, full, parity)] if full else [])
             else:
                 stamp, full = result

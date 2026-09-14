@@ -158,10 +158,13 @@ async function poll() {
     }
     const loss = v.loss_estimate == null ? null : fmt(v.loss_estimate * 100, 1) + '%';
     const recovered = m.counts.video_frames_recovered || 0;
+    const burst = v.burst_estimate == null ? null : fmt(v.burst_estimate, 1);
+    const depth = v.interleave_depth || 1;
+    const interleave = depth > 1 ? ` · 实测突发 ${burst} 包，${depth} 帧交织` : '';
     $('fecDescription').textContent = !v.layered ? '单层模式不使用 FEC'
       : c.mode !== 'fusion' ? 'FIFO 模组不报告丢包率，不使用 FEC'
       : !v.fec ? `已关闭：实测丢包 ${loss}，高清帧任一分片丢失即整帧作废`
-      : v.fec_parity ? `实测丢包 ${loss} · 每帧加 ${v.fec_parity} 个冗余包（目标 99% 可还原）· 已救回 ${recovered} 帧`
+      : v.fec_parity ? `实测丢包 ${loss}${interleave} · 每帧加 ${v.fec_parity} 个冗余包（目标 99% 可还原）· 已救回 ${recovered} 帧`
       : `实测丢包 ${loss} · 暂不需要冗余包${recovered ? ` · 已救回 ${recovered} 帧` : ''}`;
     $('layerDescription').textContent = !v.layered ? `每帧一张 ${rungText(v.full_rung)}，拥塞时整帧丢弃`
       : c.mode !== 'fusion' ? `基础层 ${rungText(v.base_rung)} + 高清层固定 ${rungText(v.full_rung)}（FIFO 无容量预算）`

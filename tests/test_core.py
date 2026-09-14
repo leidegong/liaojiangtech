@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 from nebula_mvp.config import LinkConfig
 from nebula_mvp.control import Control
-from nebula_mvp.fec import parity_count
+from nebula_mvp.fec import interleave_depth, parity_count
 from nebula_mvp.metrics import Metrics, distribution
 from nebula_mvp.protocol import (FrameAssembler, Kind, Packet, PacketFactory,
                                   QueuedPacket, MAX_DATAGRAM, fragment_count,
@@ -108,7 +108,15 @@ class ProtocolTests(unittest.TestCase):
             self.assertGreaterEqual(survive(count), .99)
             self.assertLess(survive(count - 1), .99)  # The fewest parity blocks that do.
         self.assertEqual(parity_count(20, .05), 4)
+        self.assertEqual(parity_count(20, .05, burst=1.05), 4)  # Independent runs stay i.i.d.
+        self.assertEqual(interleave_depth(1.05), 1)
+        self.assertEqual(interleave_depth(4), 2)
+        self.assertEqual(interleave_depth(8), 3)
+        self.assertEqual(parity_count(20, .05, burst=4), 6)
+        self.assertEqual(parity_count(20, .05, burst=8), 8)
+        self.assertEqual(parity_count(20, .05, burst=16), 16)
         self.assertEqual(parity_count(4, 1.0), 4)  # Capped at 100% overhead.
+        self.assertGreater(video_wire_bytes(22806, .05, burst=16), video_wire_bytes(22806, .05))
 
     def test_validate_control_and_config(self):
         for value in (float("nan"), float("inf"), True, "0.5", 2):
@@ -218,6 +226,62 @@ class SchedulerTests(unittest.TestCase):
         reasons = {reason for _, reason in self.drops}
         self.assertEqual(reasons, {"data_overflow", "data_ttl", "control_ttl", "video_wait_ttl"})
 
+    def test_interleave_holds_then_round_robins_two_frames(self):
+        from collections import defaultdict
+        from nebula_mvp.scheduler import INTERLEAVE_HOLD_NS
+        self.scheduler.interleave_depth = 2
+        first = self.frame(1)
+        self.scheduler.enqueue_frame(1, first)
+        self.assertIsNone(self.scheduler.peek(0))  # Wait for a second codeword.
+        self.assertEqual(self.scheduler.next_wakeup_ns(0), INTERLEAVE_HOLD_NS)
+        self.scheduler.enqueue_frame(2, self.frame(2))
+        order = []
+        while item := self.scheduler.pop(0):
+            order.append(item.packet.fragment().frame_id)
+        self.assertGreater(len(order), 4)
+        self.assertEqual(order[:2], [1, 2])
+        positions = defaultdict(list)
+        for index, frame_id in enumerate(order):
+            positions[frame_id].append(index)
+        for places in positions.values():
+            self.assertTrue(all(b - a >= 2 for a, b in zip(places, places[1:])))
+
+    def test_interleave_keeps_depth_frames_waiting(self):
+        self.scheduler.interleave_depth = 3
+        for fid in (1, 2, 3):
+            self.scheduler.enqueue_frame(fid, self.frame(fid))
+        self.assertEqual(self.scheduler.snapshot()["video_frames"], 3)
+        self.assertEqual(self.drops, [])
+        order = [self.scheduler.pop(0).packet.fragment().frame_id for _ in range(3)]
+        self.assertEqual(order, [1, 2, 3])
+
+    def test_interleave_releases_lone_frame_after_hold(self):
+        from nebula_mvp.scheduler import INTERLEAVE_HOLD_NS
+        self.scheduler.interleave_depth = 2
+        first = self.frame(1)
+        self.scheduler.enqueue_frame(1, first)
+        self.assertIsNone(self.scheduler.peek(INTERLEAVE_HOLD_NS - 1))
+        self.assertIs(self.scheduler.pop(INTERLEAVE_HOLD_NS), first[0])
+
+    def test_interleave_caps_hits_from_a_consecutive_run(self):
+        self.scheduler.interleave_depth = 2
+        for fid in (1, 2):
+            packets = [QueuedPacket(p, 0) for p in self.factory.video(fid, b"x" * 20 * 1170, 0, parity=5)]
+            self.scheduler.enqueue_frame(fid, packets)
+        order = []
+        while item := self.scheduler.pop(0):
+            order.append(item.packet.fragment().frame_id)
+        burst = 8
+        worst = 0
+        for start in range(len(order) - burst + 1):
+            hits = {1: 0, 2: 0}
+            for frame_id in order[start:start + burst]:
+                hits[frame_id] += 1
+            worst = max(worst, *hits.values())
+        self.assertLessEqual(worst, 4)  # A run of 8 hits at most half of each 2-way frame.
+        sequential_worst = burst  # Back-to-back fragments of one frame.
+        self.assertLess(worst, sequential_worst)
+
     def test_naive_order_and_memory_bound(self):
         self.config.mode = "naive"
         self.config.fifo_byte_limit = 100
@@ -287,6 +351,20 @@ class LayeredVideoTests(unittest.TestCase):
         link.update({"mode": "naive"})
         self.assertIsNone(link.full_layer_budget(.1))  # A FIFO modem offers nothing to budget.
         self.assertIsNone(link.loss_estimate())  # Nor a loss rate to size FEC with.
+        self.assertIsNone(link.burst_estimate())
+
+    def test_burst_estimate_follows_observed_runs(self):
+        from nebula_mvp.link_emulator import LinkEmulator
+        link = LinkEmulator(LinkConfig(), Metrics())
+        self.assertEqual(link.burst_estimate(), 1.0)
+        now = time.perf_counter()
+        for _ in range(12):
+            link.observe_loss(True, now, new_run=True)
+            for _ in range(7):
+                link.observe_loss(True, now, new_run=False)
+            for _ in range(152):
+                link.observe_loss(False, now)
+        self.assertAlmostEqual(link.burst_estimate(), 8, delta=.1)
 
     def test_burst_channel_matches_requested_loss_and_run_length(self):
         from nebula_mvp.link_emulator import LinkEmulator

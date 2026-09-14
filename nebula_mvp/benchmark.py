@@ -176,9 +176,10 @@ INTRO = {
             f"{TRANSITION_S} seconds after the switch, while the loss estimate catches up, and over the rest. "
             "Late full frames arrived after their base had already been shown in their place.",
     "burst": "Every trial sends layered video with FEC; only the mean run of consecutive lost packets "
-             "(Gilbert channel) changes, at the same average loss. Loss and burst seen are what the channel "
-             "actually did. Lost, captures shown, full-res share, FPS and freeze cover everything after the "
-             f"first {TRANSITION_S} seconds; control P99 covers the final 5 seconds.",
+             "(Gilbert channel) changes, at the same average loss. Mean runs of 1.5 packets or more also "
+             "interleave two or three full-resolution frames on the wire and may add parity. Loss and burst "
+             "seen are what the channel actually did. Lost, captures shown, full-res share, FPS and freeze "
+             f"cover everything after the first {TRANSITION_S} seconds; control P99 covers the final 5 seconds.",
 }
 
 
@@ -227,6 +228,10 @@ def check(scenario, rows, results, args):
                 f"{r['mode']}: burst seen {r['observed_burst']}"
         lost = by["burst-1"]["full_frames_lost_after"]
         assert lost is not None and lost <= .02, "Independent loss no longer matches the loss scenario"
+        for name, cap in (("burst-2", .05), ("burst-4", .06), ("burst-8", .08), ("burst-16", .12)):
+            lost = by[name]["full_frames_lost_after"]
+            assert lost is not None and lost <= cap, \
+                f"{name}: interleave+FEC left {lost:.1%} full frames unrecoverable (cap {cap:.0%})"
     else:
         plain, protected = by["layered"], by["layered-fec"]
         for r in rows:
